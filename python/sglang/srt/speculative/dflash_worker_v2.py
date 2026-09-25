@@ -1075,6 +1075,31 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         return out_tokens
 
+    def _commit_prefill_context(self, batch, logits_output, positions) -> None:
+        self._append_target_hidden_to_draft_kv_by_loc(
+            target_hidden=logits_output.hidden_states,
+            cache_loc=batch.out_cache_loc,
+            positions=positions,
+        )
+
+    def _commit_verify_context(
+        self,
+        batch,
+        hidden,
+        verify_out_cache_loc,
+        verify_out_cache_loc_2d,
+        positions,
+        commit_lens,
+    ) -> None:
+        del batch
+        self._append_target_hidden_to_draft_kv_by_loc(
+            target_hidden=hidden.reshape(-1, hidden.shape[-1]),
+            cache_loc=verify_out_cache_loc,
+            cache_loc_2d=verify_out_cache_loc_2d,
+            positions=positions,
+            commit_lens=commit_lens,
+        )
+
     def _append_target_hidden_to_draft_kv_by_loc(
         self,
         *,
@@ -1488,9 +1513,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ctx_lens,
                 int(sum(batch.extend_lens)),
             )
-            self._append_target_hidden_to_draft_kv_by_loc(
-                target_hidden=logits_output.hidden_states,
-                cache_loc=batch.out_cache_loc,
+            self._commit_prefill_context(
+                batch=batch,
+                logits_output=logits_output,
                 positions=positions,
             )
 
@@ -1925,10 +1950,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
         hidden = hidden.view(bs, int(self.block_size), -1)
 
-        self._append_target_hidden_to_draft_kv_by_loc(
-            target_hidden=hidden.reshape(-1, hidden.shape[-1]),
-            cache_loc=verify_out_cache_loc,
-            cache_loc_2d=verify_out_cache_loc_2d,
+        self._commit_verify_context(
+            batch=batch,
+            hidden=hidden,
+            verify_out_cache_loc=verify_out_cache_loc,
+            verify_out_cache_loc_2d=verify_out_cache_loc_2d,
             positions=positions,
             commit_lens=commit_lens,
         )
