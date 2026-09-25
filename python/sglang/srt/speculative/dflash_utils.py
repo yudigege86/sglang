@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -723,6 +724,45 @@ def is_dense_head_weight(weight: Any) -> bool:
     stores packed values, which a dense matmul would read as if they were
     activations."""
     return weight is not None and weight.dtype in _DENSE_HEAD_DTYPES
+
+
+def _hf_config_architectures(hf_config: Any) -> List[str]:
+    raw = _cfg_get(hf_config, "architectures", None) or []
+    if isinstance(raw, str):
+        return [raw]
+    return [str(item) for item in raw]
+
+
+def is_dflash_linear_config(hf_config: Any) -> bool:
+    """True when the draft HF config is DFlashLinearDraftModel."""
+
+    if "DFlashLinearDraftModel" in _hf_config_architectures(hf_config):
+        return True
+    dflash_cfg = _get_dflash_config(hf_config)
+    linear = dflash_cfg.get("linear_context")
+    return isinstance(linear, dict) and bool(linear)
+
+
+def is_dflash_linear_draft(server_args: Any) -> bool:
+    """Load the draft HF config and detect the linear-context architecture."""
+
+    try:
+        from sglang.srt.utils.hf_transformers_utils import get_config
+
+        model_override_args = {}
+        raw_override = getattr(server_args, "json_model_override_args", None)
+        if raw_override:
+            model_override_args = json.loads(raw_override)
+        draft_hf_config = get_config(
+            server_args.speculative_draft_model_path,
+            trust_remote_code=server_args.trust_remote_code,
+            revision=getattr(server_args, "speculative_draft_model_revision", None),
+            model_override_args=model_override_args,
+        )
+    except Exception as exc:
+        logger.warning("Failed to inspect DFLASH draft config: %s", exc)
+        return False
+    return is_dflash_linear_config(draft_hf_config)
 
 
 def can_dflash_slice_qkv_weight(qkv_proj: Any) -> Tuple[bool, str]:

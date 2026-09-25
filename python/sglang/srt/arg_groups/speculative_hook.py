@@ -314,6 +314,21 @@ def _handle_dflash(server_args: ServerArgs) -> None:
                 f"window_size={cfg.speculative_draft_window_size}, block_size={draft_tokens}."
             )
 
+    from sglang.srt.speculative.dflash_utils import is_dflash_linear_draft
+
+    if is_dflash_linear_draft(server_args):
+        if server_args.speculative_draft_window_size is not None:
+            raise ValueError(
+                "DFlashLinear does not support --speculative-dflash-draft-window-size"
+            )
+        if int(server_args.tp_size) > 1:
+            raise ValueError("DFlashLinear serving currently requires --tp-size 1")
+        if not bool(getattr(server_args, "disable_radix_cache", False)):
+            raise ValueError(
+                "DFlashLinear requires --disable-radix-cache "
+                "(GDN state is not prefix-cacheable yet)"
+            )
+
     _resolve_dflash_draft_attention_backend(server_args)
 
     if cfg.max_running_requests is None:
