@@ -79,7 +79,11 @@ class DFlashLinearWorkerV2(DFlashWorkerV2):
         )
 
     def init_cuda_graphs(self):
-        logger.info("DFlashLinear skips draft CUDA-graph capture (M1 eager path)")
+        # M1 is eager: still run ModelRunner graph setup so eager_runner and
+        # decode_cuda_graph_runner exist (the latter is None). Skipping this
+        # leaves _forward_raw accessing a missing attribute.
+        logger.info("DFlashLinear uses eager draft forward (M1); skipping draft CUDA-graph capture")
+        self._draft_worker.init_cuda_graphs(capture_decode_cuda_graph=False)
 
     def clear_cache_pool(self):
         if self.ctx_state is not None:
