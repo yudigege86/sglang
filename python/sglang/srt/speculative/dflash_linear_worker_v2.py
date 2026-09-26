@@ -13,6 +13,7 @@ from typing import Optional
 import torch
 
 from sglang.srt.speculative.dflash_linear_state import (
+    commit_block_masked,
     fla_varlen_final_states,
     gated_delta_scan,
 )
@@ -36,7 +37,8 @@ class DFlashLinearWorkerV2(DFlashWorkerV2):
             )
         self.ctx_state: Optional[torch.Tensor] = None
         self.owner_gen: Optional[torch.Tensor] = None
-        self._shadow_aux: dict[int, list[torch.Tensor]] = {}
+        # (kind, aux[, commit_len]) events used to replay the serving path.
+        self._shadow_events: dict[int, list[tuple]] = {}
         self._shadow_check = os.environ.get("SGLANG_DFLASH_LINEAR_SHADOW_CHECK", "0") == "1"
 
     def alloc_memory_pool(
@@ -93,7 +95,7 @@ class DFlashLinearWorkerV2(DFlashWorkerV2):
             self.ctx_state.zero_()
         if self.owner_gen is not None:
             self.owner_gen.fill_(-1)
-        self._shadow_aux.clear()
+        self._shadow_events.clear()
 
     def _ensure_owners(self, batch) -> None:
         if self.ctx_state is None or self.owner_gen is None:
@@ -117,7 +119,7 @@ class DFlashLinearWorkerV2(DFlashWorkerV2):
                 )
             self.ctx_state[idx].zero_()
             self.owner_gen[idx] = gen
-            self._shadow_aux.pop(idx, None)
+            self._shadow_events.pop(idx, None)
 
     def _commit_prefill_context(self, batch, logits_output, positions) -> None:
         del positions
@@ -155,7 +157,7 @@ class DFlashLinearWorkerV2(DFlashWorkerV2):
             offset += length
             if length <= 0 or idx <= 0:
                 continue
-            self._shadow_aux.setdefault(idx, []).append(chunk.cpu())
+            self._shadow_events.setdefault(idx, []).append(("prefill", chunk.cpu()))
             self._shadow_check_row(idx)
 
     def _shadow_append_verify(self, batch, hidden, commit_lens) -> None:
@@ -167,54 +169,83 @@ class DFlashLinearWorkerV2(DFlashWorkerV2):
             n = int(commit_cpu[i])
             if n <= 0:
                 continue
-            self._shadow_aux.setdefault(idx, []).append(hidden[i, :n].detach().cpu())
+            # Store the full B-token verify aux plus commit_len so the
+            # identity-masked recurrence matches serving exactly.
+            self._shadow_events.setdefault(idx, []).append(
+                ("verify", hidden[i].detach().cpu(), n)
+            )
             self._shadow_check_row(idx)
 
     def _shadow_check_row(self, idx: int) -> None:
-        pieces = self._shadow_aux.get(idx)
-        if not pieces:
+        events = self._shadow_events.get(idx)
+        if not events or self.ctx_state is None:
             return
-        aux = torch.cat(pieces, dim=0).to(device=self.device)
-        fused = self.draft_model.project_target_hidden(aux)
-        seq_len = int(fused.shape[0])
-        fused_b = fused.unsqueeze(0)
-        for layer_idx, layer in enumerate(self.draft_model.layers):
-            scan = layer.context_scan
-            key, value, log_decay, beta = scan.project(fused_b)
-            cu = torch.tensor([0, seq_len], dtype=torch.int32, device=key.device)
-            initial = torch.zeros(
-                1,
-                key.shape[2],
-                key.shape[3],
-                value.shape[-1],
-                dtype=key.dtype,
-                device=key.device,
-            )
-            finals = fla_varlen_final_states(
-                key[0],
-                value[0],
-                log_decay[0],
-                beta[0],
-                cu,
-                initial,
-                normalize_qk=scan.normalize_qk,
-            )
-            if finals is None:
-                expected = gated_delta_scan(
-                    key,
-                    value,
-                    log_decay,
-                    beta,
-                    normalize_qk=scan.normalize_qk,
-                )[0]
-            else:
-                expected = finals[0]
-            got = self.ctx_state[idx, layer_idx].to(dtype=expected.dtype)
-            # Serving mixes FLA prefill with a naive verify commit and keeps
-            # FP32 state; the rescan is BF16. 0.015 on 147 tokens is BF16 noise.
-            if not torch.allclose(got.float(), expected.float(), rtol=5e-2, atol=5e-2):
-                max_abs = float((got.float() - expected.float()).abs().max().item())
-                raise RuntimeError(
-                    f"DFlashLinear shadow check failed req={idx} layer={layer_idx} "
-                    f"max_abs={max_abs}"
+        expected = torch.zeros_like(self.ctx_state[idx])
+        for event in events:
+            kind = event[0]
+            if kind == "prefill":
+                aux = event[1].to(device=self.device)
+                fused = self.draft_model.project_target_hidden(aux).unsqueeze(0)
+                for layer_idx, layer in enumerate(self.draft_model.layers):
+                    scan = layer.context_scan
+                    key, value, log_decay, beta = scan.project(fused)
+                    seq_len = int(key.shape[1])
+                    cu = torch.tensor(
+                        [0, seq_len], dtype=torch.int32, device=key.device
+                    )
+                    initial = expected[layer_idx : layer_idx + 1].to(dtype=key.dtype)
+                    finals = fla_varlen_final_states(
+                        key[0],
+                        value[0],
+                        log_decay[0],
+                        beta[0],
+                        cu,
+                        initial,
+                        normalize_qk=scan.normalize_qk,
+                    )
+                    if finals is None:
+                        updated = gated_delta_scan(
+                            key,
+                            value,
+                            log_decay,
+                            beta,
+                            initial_state=initial,
+                            normalize_qk=scan.normalize_qk,
+                        )[0]
+                    else:
+                        updated = finals[0]
+                    expected[layer_idx] = updated.to(dtype=expected.dtype)
+            elif kind == "verify":
+                aux = event[1].to(device=self.device)
+                commit_n = int(event[2])
+                if aux.ndim == 2:
+                    aux = aux.unsqueeze(0)
+                fused = self.draft_model.project_target_hidden(
+                    aux.reshape(-1, aux.shape[-1])
+                ).view(1, aux.shape[1], -1)
+                commit = torch.tensor(
+                    [commit_n], device=self.device, dtype=torch.int32
                 )
+                for layer_idx, layer in enumerate(self.draft_model.layers):
+                    scan = layer.context_scan
+                    key, value, log_decay, beta = scan.project(fused)
+                    state = expected[layer_idx : layer_idx + 1].to(dtype=key.dtype)
+                    updated = commit_block_masked(
+                        state,
+                        key,
+                        value,
+                        log_decay,
+                        beta,
+                        commit,
+                        normalize_qk=scan.normalize_qk,
+                    )
+                    expected[layer_idx] = updated[0].to(dtype=expected.dtype)
+            else:
+                raise RuntimeError(f"unknown shadow event {kind!r}")
+        got = self.ctx_state[idx]
+        if not torch.allclose(got.float(), expected.float(), rtol=1e-2, atol=1e-2):
+            max_abs = float((got.float() - expected.float()).abs().max().item())
+            raise RuntimeError(
+                f"DFlashLinear shadow check failed req={idx} max_abs={max_abs} "
+                "(mixed FLA-prefill + naive-verify replay)"
+            )
