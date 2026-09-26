@@ -367,7 +367,6 @@ class DFlashLinearDraftModel(nn.Module):
         if target_hidden is None or target_hidden.numel() == 0:
             return
         fused = self.project_target_hidden(target_hidden)
-        offset = 0
         rows = req_indices.to(dtype=torch.long)
         for layer_idx, layer in enumerate(self.layers):
             scan = layer.context_scan
@@ -388,7 +387,6 @@ class DFlashLinearDraftModel(nn.Module):
                 packed_decay.append(log_decay[0])
                 packed_beta.append(beta[0])
                 lengths.append(int(length))
-            del offset
             if not packed_key:
                 continue
             key = torch.cat(packed_key, dim=0)
