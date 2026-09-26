@@ -226,6 +226,8 @@ class DFlashLinearDecoderLayer(nn.Module):
         query = self.context_query(query_in).view(batch, num_anchors, block, num_heads, key_dim)
         if self.settings["normalize_qk"]:
             query = query * torch.rsqrt(query.pow(2).sum(dim=-1, keepdim=True) + 1e-6)
+        # Serving state is FP32; the draft forward is BF16.
+        prefix_state = prefix_state.to(dtype=query.dtype)
         retrieved = torch.einsum("baqhk,bahkv->baqhv", query, prefix_state)
         retrieved = retrieved.reshape(batch, num_anchors, block, -1)
         return self.context_read_proj(retrieved)
