@@ -304,6 +304,14 @@ class DFlashLinearDraftModel(nn.Module):
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_eps)
         self.block_size = int(draft_config.resolve_block_size(default=16) or 16)
         self.ctx_state: Optional[torch.Tensor] = None
+        # Stock DFlashWorkerV2 reads this; linear drafts have no DFlash2 selector.
+        self.candidate_selector = None
+
+    def set_block_size(self, block_size: int) -> None:
+        """Adopt the block size the worker resolved (v0.5.19 DFlashWorkerV2)."""
+        self.block_size = int(block_size)
+        for layer in self.layers:
+            layer.block_size = self.block_size
 
     def bind_context_state(self, ctx_state: torch.Tensor) -> None:
         self.ctx_state = ctx_state
