@@ -4,6 +4,10 @@ Same DFLASH algorithm as stock ``DFlashDraftModel``, but context is a
 fixed-size GDN state per request per layer plus dense B-token attention.
 Weight names match SpecForge ``DFlashLinearDraftModel`` so HF exports load
 without remapping fused QKV.
+
+Serve with the 0.5.19 eval image, not the 0.5.18 train image. See
+``DFLASH_LINEAR.md`` in this repo and SpecForge
+``docs/linear-context-dflash-docker.md``.
 """
 
 from __future__ import annotations
